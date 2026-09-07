@@ -13,7 +13,7 @@ name = "perl_build"
 path = "src/lib.rs"
 
 [dependencies]
-metacpan-api-modern = { git = "https://github.com/uperl/rust-metacpan-api-modern", branch = "main" }
+metacpan-api-modern = { git = "https://github.com/uperl/rust-metacpan-api-modern", tag = "v0.3.0" }
 serde_json = "1"
 thiserror = "2"
 log = "0.4"
