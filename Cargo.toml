@@ -1,0 +1,12 @@
+[package]
+name = "perl-build"
+version = "0.1.0"
+edition = "2024"
+description = "Build new Perls from source"
+repository = "https://github.com/uperl/perl-build"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+
+
