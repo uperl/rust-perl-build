@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,44 @@ pub enum PatchPerl {
     Disabled,
 }
 
+/// Which toolchain compiles the unpacked Perl source tree.
+///
+/// `Perl::Build` only ever runs the Unix `sh Configure` / `make` path. This
+/// crate adds a Windows path that builds `win32\Makefile` with `nmake` and
+/// Microsoft Visual C++, and makes it the default when running on Windows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Toolchain {
+    /// [`Msvc`](Self::Msvc) on Windows, [`GnuConfigure`](Self::GnuConfigure)
+    /// everywhere else. The default.
+    #[default]
+    Auto,
+    /// Unix-style: `sh Configure -de ...`, then `make`, `make test_harness`,
+    /// `make install`.
+    GnuConfigure,
+    /// Windows: build `win32\Makefile` from the source tree with `nmake` and
+    /// Microsoft Visual C++, then `nmake test` / `nmake install`.
+    ///
+    /// `cl.exe` must be on `PATH`, so run from a Visual Studio "x64 Native
+    /// Tools" command prompt or a shell that has sourced `vcvarsall.bat`. The
+    /// install prefix is passed as the `INST_TOP` / `INST_DRV` macros (the
+    /// Makefile is not edited), and `CCTYPE` — which that Makefile requires and
+    /// does not default — is detected by running `cl`, unless it is already
+    /// given in `PERL_BUILD_COMPILE_OPTIONS`. Override the make program with the
+    /// `PERL_BUILD_NMAKE` environment variable.
+    Msvc,
+}
+
+impl Toolchain {
+    /// Resolve [`Auto`](Self::Auto) to the concrete toolchain for this platform.
+    fn resolved(self) -> Toolchain {
+        match self {
+            Toolchain::Auto if cfg!(windows) => Toolchain::Msvc,
+            Toolchain::Auto => Toolchain::GnuConfigure,
+            explicit => explicit,
+        }
+    }
+}
+
 /// A configurable Perl build.
 ///
 /// Create one with [`PerlBuild::new`], set options with the builder methods,
@@ -44,6 +82,7 @@ pub struct PerlBuild {
     build_dir: Option<PathBuf>,
     tarball_dir: Option<PathBuf>,
     patchperl: PatchPerl,
+    toolchain: Toolchain,
     client: Option<Client>,
 }
 
@@ -62,6 +101,7 @@ impl PerlBuild {
             build_dir: None,
             tarball_dir: None,
             patchperl: PatchPerl::Auto,
+            toolchain: Toolchain::Auto,
             client: None,
         }
     }
@@ -123,6 +163,13 @@ impl PerlBuild {
         self
     }
 
+    /// Choose the build toolchain. Default: [`Toolchain::Auto`] —
+    /// [`Toolchain::Msvc`] on Windows, [`Toolchain::GnuConfigure`] elsewhere.
+    pub fn toolchain(mut self, toolchain: Toolchain) -> Self {
+        self.toolchain = toolchain;
+        self
+    }
+
     /// Supply a configured [`metacpan_api_modern::Client`] for CPAN version
     /// resolution and downloads. A default client is used otherwise.
     pub fn metacpan_client(mut self, client: Client) -> Self {
@@ -179,19 +226,50 @@ impl PerlBuild {
         self.install_from_source(&src)
     }
 
-    /// Build from an already-unpacked source tree. Runs `Configure`, `make`,
-    /// optionally `make test`, then `make install`. Equivalent to
+    /// Build from an already-unpacked source tree. Equivalent to
     /// `Perl::Build->install`; needs no network or async runtime.
+    ///
+    /// The steps depend on [`toolchain`](Self::toolchain): `sh Configure` /
+    /// `make` / `make install` for [`Toolchain::GnuConfigure`], or `nmake` from
+    /// the source tree's `win32\` directory for [`Toolchain::Msvc`] (the
+    /// default on Windows).
     pub fn install_from_source(&self, src_path: impl AsRef<Path>) -> Result<Built> {
         let src = src_path.as_ref();
         let dst = absolute(&self.dst_path)?;
+        let toolchain = self.toolchain.resolved();
         log::info!(
-            "building perl from {} into {}",
+            "building perl from {} into {} with {toolchain:?}",
             src.display(),
             dst.display()
         );
 
-        let configure_options = self.resolved_configure_options(&dst);
+        self.run_patchperl(src)?;
+
+        match toolchain {
+            Toolchain::Msvc => self.build_msvc(src, &dst)?,
+            _ => self.build_gnu_configure(src, &dst)?,
+        }
+
+        let built = Built::new(dst);
+
+        if toolchain != Toolchain::Msvc
+            && self
+                .configure_options
+                .iter()
+                .any(|o| o.contains("usedevel"))
+        {
+            log::info!("-Dusedevel build: linking versioned executables");
+            symlink_devel_executables(&built.bin_dir())?;
+        }
+
+        log::info!("installed perl in {}", built.prefix().display());
+        Ok(built)
+    }
+
+    /// The Unix build: `sh Configure` then `make` / `make test` / `make
+    /// install`.
+    fn build_gnu_configure(&self, src: &Path, dst: &Path) -> Result<()> {
+        let configure_options = self.resolved_configure_options(dst);
 
         // A stale config from an earlier, aborted build confuses Configure.
         for stale in ["config.sh", "Policy.sh"] {
@@ -201,8 +279,6 @@ impl PerlBuild {
                 let _ = std::fs::remove_file(&path);
             }
         }
-
-        self.run_patchperl(src)?;
 
         // Configure
         let mut configure = self.build_command("sh", src);
@@ -241,15 +317,75 @@ impl PerlBuild {
         append_split(&mut install, env_opt("PERL_BUILD_INSTALL_OPTIONS"));
         run(&mut install, "make install")?;
 
-        let built = Built::new(dst);
+        Ok(())
+    }
 
-        if configure_options.iter().any(|o| o.contains("usedevel")) {
-            log::info!("-Dusedevel build: linking versioned executables");
-            symlink_devel_executables(&built.bin_dir())?;
+    /// The Windows build: `win32\Makefile` driven by `nmake` and Visual C++.
+    ///
+    /// `INST_TOP` / `INST_DRV` are passed as command-line macros so the source
+    /// tree's `win32\Makefile` does not have to be edited. `CCTYPE` has no
+    /// default in that Makefile and it refuses to build without one, so it is
+    /// detected by running `cl` unless the caller has already set it through
+    /// `PERL_BUILD_COMPILE_OPTIONS`.
+    fn build_msvc(&self, src: &Path, dst: &Path) -> Result<()> {
+        let win32 = src.join("win32");
+        if !win32.join("Makefile").is_file() {
+            return Err(Error::Other(format!(
+                "no win32\\Makefile under {} — an MSVC build needs a Windows \
+                 Perl source tree",
+                src.display()
+            )));
         }
 
-        log::info!("installed perl in {}", built.prefix().display());
-        Ok(built)
+        let nmake = nmake_program();
+        let nmake_label = nmake.to_string_lossy().into_owned();
+
+        let mut macros = msvc_install_macros(dst);
+        let compile_options = env_opt("PERL_BUILD_COMPILE_OPTIONS");
+        let caller_set_cctype = compile_options
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|w| w.starts_with("CCTYPE="));
+        if !caller_set_cctype {
+            match detect_msvc_cctype() {
+                Some(cctype) => {
+                    log::info!("detected Visual C++: CCTYPE={cctype}");
+                    macros.push(format!("CCTYPE={cctype}"));
+                }
+                None => log::warn!(
+                    "could not detect the Visual C++ version by running `cl`; \
+                     win32\\Makefile requires CCTYPE. Run this from a Visual \
+                     Studio \"x64 Native Tools\" command prompt, or set it via \
+                     `PERL_BUILD_COMPILE_OPTIONS=CCTYPE=MSVC143` (or similar)."
+                ),
+            }
+        }
+
+        // nmake
+        let mut make = self.build_command(&nmake, &win32);
+        make.args(&macros);
+        append_split(&mut make, compile_options);
+        run(&mut make, &format!("{nmake_label} {}", macros.join(" ")))?;
+
+        // nmake test
+        if self.test {
+            let mut test = self.build_command(&nmake, &win32);
+            test.args(&macros).arg("test");
+            if let Some(jobs) = self.jobs {
+                test.env("TEST_JOBS", jobs.to_string());
+                test.env("HARNESS_OPTIONS", format!("j{jobs}"));
+            }
+            run(&mut test, &format!("{nmake_label} test"))?;
+        }
+
+        // nmake install
+        let mut install = self.build_command(&nmake, &win32);
+        install.args(&macros).arg("install");
+        append_split(&mut install, env_opt("PERL_BUILD_INSTALL_OPTIONS"));
+        run(&mut install, &format!("{nmake_label} install"))?;
+
+        Ok(())
     }
 
     // -- internals ----------------------------------------------------------
@@ -281,6 +417,14 @@ impl PerlBuild {
         cmd.current_dir(cwd);
         cmd.env_remove("PERL5LIB");
         cmd.env_remove("PERL5OPT");
+        // Perl's win32\Makefile invokes `miniperl` / `perl` bare from the source
+        // tree, relying on the legacy behaviour where the current directory is
+        // searched for executables. When `NoDefaultCurrentDirectoryInExePath` is
+        // set in the environment that lookup is disabled and the build dies with
+        // "'miniperl' is not recognized". Restore it for the build subprocess
+        // tree.
+        #[cfg(windows)]
+        cmd.env_remove("NoDefaultCurrentDirectoryInExePath");
         cmd
     }
 
@@ -420,6 +564,75 @@ fn append_split(cmd: &mut Command, value: Option<String>) {
             cmd.arg(arg);
         }
     }
+}
+
+/// The make program for the Windows / Visual C++ build. `nmake` (which ships
+/// with Visual C++) unless overridden with `PERL_BUILD_NMAKE`.
+fn nmake_program() -> OsString {
+    std::env::var_os("PERL_BUILD_NMAKE").unwrap_or_else(|| OsString::from("nmake"))
+}
+
+/// `INST_TOP=` (always) and `INST_DRV=` (when a drive letter can be recovered)
+/// macros that repoint `win32\Makefile` from its built-in `C:\perl` to `dst`.
+fn msvc_install_macros(dst: &Path) -> Vec<String> {
+    let inst_top = dst.to_string_lossy().replace('/', "\\");
+    let mut macros = vec![format!("INST_TOP={inst_top}")];
+    if let Some(drive) = windows_drive(dst) {
+        macros.push(format!("INST_DRV={drive}"));
+    }
+    macros
+}
+
+/// The upper-cased `C:`-style drive prefix of `path`, on platforms that parse
+/// one (i.e. Windows); `None` otherwise.
+fn windows_drive(path: &Path) -> Option<String> {
+    match path.components().next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                Some(format!("{}:", (d as char).to_ascii_uppercase()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Best-effort `CCTYPE` for `win32\Makefile`, which has no compiler
+/// auto-detection of its own. Runs `cl` and maps its version banner to the
+/// `MSVCnnn` token Perl expects; `None` if `cl` will not run or its banner
+/// cannot be parsed.
+fn detect_msvc_cctype() -> Option<String> {
+    // `cl` with no arguments writes its banner to stderr and exits non-zero.
+    let out = Command::new("cl").output().ok()?;
+    let banner = String::from_utf8_lossy(&out.stderr);
+    cctype_for_msc_ver(parse_cl_msc_ver(&banner)?)
+}
+
+/// Pull the `_MSC_VER`-style number out of a `cl` banner: the `19.44` in
+/// `... Optimizing Compiler Version 19.44.35207.1 for x64` becomes `1944`.
+/// Scans for the first `MAJOR.MINOR.BUILD` token with a plausible major version
+/// rather than matching surrounding words, so it survives localized banners.
+fn parse_cl_msc_ver(banner: &str) -> Option<u32> {
+    banner.split_whitespace().find_map(|token| {
+        let mut parts = token.split('.');
+        let major: u32 = parts.next()?.parse().ok()?;
+        let minor: u32 = parts.next()?.parse().ok()?;
+        (parts.next().is_some() && (19..=40).contains(&major)).then_some(major * 100 + minor)
+    })
+}
+
+/// Map an `_MSC_VER` number to Perl's `CCTYPE`. Visual C++ 2022's whole
+/// 14.3x–14.4x line is `MSVC143`; 14.5+ (VS 2026) is `MSVC145`.
+fn cctype_for_msc_ver(msc_ver: u32) -> Option<String> {
+    let name = match msc_ver {
+        1900..=1909 => "MSVC140",
+        1910..=1919 => "MSVC141",
+        1920..=1929 => "MSVC142",
+        1930..=1949 => "MSVC143",
+        v if v >= 1950 => "MSVC145",
+        _ => return None,
+    };
+    Some(name.to_owned())
 }
 
 fn tar_program() -> OsString {
@@ -579,6 +792,59 @@ mod tests {
         assert_eq!(parse_define_u32(text, "PERL_VERSION"), Some(38));
         assert_eq!(parse_define_u32(text, "PERL_SUBVERSION"), Some(2));
         assert_eq!(parse_define_u32(text, "PERL_NOPE"), None);
+    }
+
+    #[test]
+    fn toolchain_auto_picks_platform_default() {
+        assert_eq!(Toolchain::Msvc.resolved(), Toolchain::Msvc);
+        assert_eq!(Toolchain::GnuConfigure.resolved(), Toolchain::GnuConfigure);
+        let expected = if cfg!(windows) {
+            Toolchain::Msvc
+        } else {
+            Toolchain::GnuConfigure
+        };
+        assert_eq!(Toolchain::Auto.resolved(), expected);
+    }
+
+    #[test]
+    fn msvc_macros_point_at_prefix() {
+        let macros = msvc_install_macros(Path::new(r"C:\opt\perl-5.40"));
+        assert_eq!(macros[0], r"INST_TOP=C:\opt\perl-5.40");
+        // The drive is only recoverable where the platform parses a prefix.
+        if cfg!(windows) {
+            assert!(macros.iter().any(|m| m == "INST_DRV=C:"));
+        }
+    }
+
+    #[test]
+    fn msvc_macros_normalise_forward_slashes() {
+        let macros = msvc_install_macros(Path::new("Z:/perls/dev"));
+        assert_eq!(macros[0], r"INST_TOP=Z:\perls\dev");
+    }
+
+    #[test]
+    fn parses_cl_version_banner() {
+        assert_eq!(
+            parse_cl_msc_ver(
+                "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207.1 for x64"
+            ),
+            Some(1944)
+        );
+        assert_eq!(
+            parse_cl_msc_ver("... Compiler Version 19.00.24245.1 for x86"),
+            Some(1900)
+        );
+        assert_eq!(parse_cl_msc_ver("no version here"), None);
+    }
+
+    #[test]
+    fn maps_msc_ver_to_cctype() {
+        assert_eq!(cctype_for_msc_ver(1900).as_deref(), Some("MSVC140"));
+        assert_eq!(cctype_for_msc_ver(1916).as_deref(), Some("MSVC141"));
+        assert_eq!(cctype_for_msc_ver(1929).as_deref(), Some("MSVC142"));
+        assert_eq!(cctype_for_msc_ver(1944).as_deref(), Some("MSVC143"));
+        assert_eq!(cctype_for_msc_ver(1952).as_deref(), Some("MSVC145"));
+        assert_eq!(cctype_for_msc_ver(1800), None);
     }
 
     #[test]
