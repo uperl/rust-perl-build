@@ -1,12 +1,22 @@
 [package]
 name = "perl-build"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-description = "Build new Perls from source"
+description = "Build new Perls from source, modelled after the Perl::Build CPAN distribution"
 repository = "https://github.com/uperl/perl-build"
 license = "MIT"
+keywords = ["perl", "build", "cpan", "metacpan"]
+categories = ["development-tools::build-utils"]
+
+[lib]
+name = "perl_build"
+path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.104"
+metacpan-api-modern = { version = "0.3.0", git = "https://github.com/uperl/rust-metacpan-api-modern", tag = "v0.3.0" }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
 
-
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
