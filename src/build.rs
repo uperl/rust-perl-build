@@ -417,6 +417,14 @@ impl PerlBuild {
         cmd.current_dir(cwd);
         cmd.env_remove("PERL5LIB");
         cmd.env_remove("PERL5OPT");
+        // Perl's win32\Makefile invokes `miniperl` / `perl` bare from the source
+        // tree, relying on the legacy behaviour where the current directory is
+        // searched for executables. When `NoDefaultCurrentDirectoryInExePath` is
+        // set in the environment that lookup is disabled and the build dies with
+        // "'miniperl' is not recognized". Restore it for the build subprocess
+        // tree.
+        #[cfg(windows)]
+        cmd.env_remove("NoDefaultCurrentDirectoryInExePath");
         cmd
     }
 
