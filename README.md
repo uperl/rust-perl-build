@@ -4,7 +4,8 @@ Build new Perls from source — a Rust port of the
 [`Perl::Build`](https://metacpan.org/pod/Perl::Build) CPAN distribution.
 
 `perl-build` downloads a Perl source tarball (from CPAN, an arbitrary URL, or
-the local filesystem), unpacks it, runs `Configure` / `make` / `make install`,
+the local filesystem), unpacks it, runs `Configure` / `make` / `make install`
+(or `nmake` against `win32\Makefile` on Windows — see [Windows](#windows) below),
 and leaves you a ready-to-use Perl under a prefix you choose. Perl releases are
 located through
 [`metacpan-api-modern`](https://github.com/uperl/rust-metacpan-api-modern), so a
@@ -83,16 +84,34 @@ when found on `PATH` and skipped with a warning otherwise. Install it with
 `cpanm App::patchperl`, or point at a specific one with `PerlBuild::patchperl`.
 `PERL5_PATCHPERL_PLUGIN` is inherited by the `patchperl` child process.
 
+## Windows
+
+On Windows the default toolchain builds `win32\Makefile` from the source tree
+with `nmake` and Microsoft Visual C++ (`nmake` / `nmake test` / `nmake
+install`), following
+[`README.win32`](https://github.com/Perl/perl5/blob/blead/README.win32).
+`cl.exe` must be on `PATH`, so run from a Visual Studio "x64 Native Tools"
+command prompt, or from a shell that has sourced `vcvarsall.bat`.
+
+* The install prefix is passed to the Makefile as the `INST_TOP` / `INST_DRV`
+  macros — the source tree is not edited.
+* `win32\Makefile` requires `CCTYPE` and does not detect the compiler itself, so
+  `perl-build` runs `cl` and maps its version to `MSVC140`…`MSVC145`. Set
+  `CCTYPE=...` in `PERL_BUILD_COMPILE_OPTIONS` to override.
+* `PerlBuild::toolchain(Toolchain::GnuConfigure)` forces the Unix `sh Configure`
+  path instead (and `Toolchain::Msvc` forces the MSVC path off Windows).
+
 ## Environment variables
 
 Honoured for parity with `Perl::Build`:
 
 | variable | effect |
 | --- | --- |
-| `PERL_BUILD_COMPILE_OPTIONS` | extra arguments appended to `make` |
+| `PERL_BUILD_COMPILE_OPTIONS` | extra arguments appended to `make` (or `nmake`; a `CCTYPE=...` here disables auto-detection) |
 | `PERL_BUILD_INSTALL_OPTIONS` | extra arguments appended to `make install` |
 | `PERL5_PATCHPERL_PLUGIN` | read by `patchperl` (Devel::PatchPerl plugin) |
 | `PERL_BUILD_TAR` | `tar` program to use for unpacking (default `tar`, `gtar` on illumos/Solaris) |
+| `PERL_BUILD_NMAKE` | make program for the Windows / Visual C++ build (default `nmake`) |
 
 `PERL5LIB` and `PERL5OPT` are removed from the environment of every build
 command, so an active perlbrew / local::lib does not perturb the build.

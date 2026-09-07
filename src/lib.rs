@@ -2,8 +2,9 @@
 //!
 //! This crate is a Rust port of the [`Perl::Build`] CPAN distribution. It
 //! downloads a Perl source tarball (from CPAN, an arbitrary URL, or the local
-//! filesystem), unpacks it, runs `Configure` / `make` / `make install`, and
-//! leaves you a ready-to-use Perl under a prefix you choose.
+//! filesystem), unpacks it, runs `Configure` / `make` / `make install` (or
+//! `nmake` against `win32\Makefile` on Windows — see [below](#windows-and-visual-c)),
+//! and leaves you a ready-to-use Perl under a prefix you choose.
 //!
 //! Perl releases are located through [`metacpan-api-modern`][mcm], so the same
 //! resolution CPAN clients use is available here: give a version like `5.38.2`
@@ -76,6 +77,22 @@
 //! [`PerlBuild::patchperl`]. The `PERL5_PATCHPERL_PLUGIN` environment variable
 //! is inherited by the `patchperl` child process, so patch plugins work as they
 //! do for `Perl::Build`.
+//!
+//! # Windows and Visual C++
+//!
+//! On Windows the default toolchain ([`Toolchain::Auto`]) builds
+//! `win32\Makefile` from the source tree with `nmake` and Microsoft Visual
+//! C++, rather than `sh Configure` / `make`. `cl.exe` must be on `PATH`, so run
+//! from a Visual Studio "x64 Native Tools" command prompt or a shell that has
+//! sourced `vcvarsall.bat`.
+//!
+//! The installation prefix is handed to the Makefile as the `INST_TOP` /
+//! `INST_DRV` macros, so the source tree is not edited. `win32\Makefile`
+//! requires `CCTYPE` and has no detection of its own, so this crate runs `cl`
+//! to work it out — unless `PERL_BUILD_COMPILE_OPTIONS` already contains a
+//! `CCTYPE=...` entry. Force a particular toolchain (the Unix path on Windows,
+//! or the MSVC path elsewhere) with [`PerlBuild::toolchain`]. The make program
+//! can be overridden with `PERL_BUILD_NMAKE`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -85,7 +102,7 @@ mod built;
 mod error;
 mod releases;
 
-pub use build::{PatchPerl, PerlBuild, extract_tarball};
+pub use build::{PatchPerl, PerlBuild, Toolchain, extract_tarball};
 pub use built::{Built, symlink_devel_executables};
 pub use error::{Error, Result};
 pub use releases::{PerlRelease, PerlReleases};

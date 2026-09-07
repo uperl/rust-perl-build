@@ -35,9 +35,10 @@ impl Built {
         self.prefix.join("bin")
     }
 
-    /// `<prefix>/bin/perl`.
+    /// `<prefix>/bin/perl` (`<prefix>\bin\perl.exe` on Windows).
     pub fn perl(&self) -> PathBuf {
-        self.bin_dir().join("perl")
+        let name = if cfg!(windows) { "perl.exe" } else { "perl" };
+        self.bin_dir().join(name)
     }
 
     /// The environment changes needed to run this Perl: `PATH` with
