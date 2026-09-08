@@ -50,6 +50,11 @@ pub enum Error {
     #[error("tarball {0} does not unpack to exactly one top-level directory")]
     TarballLayout(PathBuf),
 
+    /// The in-process [`patch-perl`](patch_perl) port failed to apply the
+    /// Devel::PatchPerl fix-ups.
+    #[error("Devel::PatchPerl fix-ups failed: {0}")]
+    PatchPerl(#[from] patch_perl::Error),
+
     /// A filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
