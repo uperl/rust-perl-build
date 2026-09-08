@@ -1,6 +1,5 @@
 //! [`PerlBuild`]: configure a build and run it.
 
-use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Command;
@@ -222,7 +221,8 @@ impl PerlBuild {
     }
 
     /// Unpack a local source tarball and build it. Handles `.tar.gz`,
-    /// `.tar.bz2`, `.tar.xz`, and uncompressed `.tar`. Equivalent to
+    /// `.tar.bz2`, `.tar.xz`, uncompressed `.tar`, and `.zip`, unpacked
+    /// in-process (see [`extract_tarball`]). Equivalent to
     /// `Perl::Build->install_from_tarball`; needs no network or async runtime.
     pub fn install_from_tarball(&self, tarball: impl AsRef<Path>) -> Result<Built> {
         let tarball = tarball.as_ref();
@@ -503,63 +503,23 @@ fn run_patchperl_internal(src: &Path) -> Result<()> {
 /// Unpack `tarball` into `dest`, returning the path of the single top-level
 /// directory it contains.
 ///
-/// Compression is chosen from the file extension (`.gz`/`.tgz`, `.bz2`/`.tbz`,
-/// `.xz`/`.txz`, or none). The `tar` program is used (`gtar` on illumos /
-/// Solaris); override it with the `PERL_BUILD_TAR` environment variable.
+/// The archive format is detected from its magic bytes (falling back to the
+/// file name) and unpacked in-process by the
+/// [`cpan-distribution-extractor`](cpan_distribution_extractor) crate:
+/// `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz`, `.tar.xz`/`.txz`, and `.zip`.
+/// No external `tar` program is required.
 pub fn extract_tarball(tarball: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result<PathBuf> {
     let tarball = tarball.as_ref();
     let dest = dest.as_ref();
-    std::fs::create_dir_all(dest)?;
+    log::info!("extracting {} into {}", tarball.display(), dest.display());
 
-    let tar = tar_program();
-    let compression = compression_flag(tarball);
-
-    // List first, to find (and sanity-check) the top-level directory.
-    let mut list = Command::new(&tar);
-    if let Some(flag) = compression {
-        list.arg(flag);
-    }
-    list.arg("-tf").arg(tarball);
-    let label = format!("{} -tf {}", tar.to_string_lossy(), tarball.display());
-    let output = list.output().map_err(|e| Error::Spawn(label.clone(), e))?;
-    if !output.status.success() {
-        return Err(Error::Command {
-            command: label,
-            status: output.status,
-        });
-    }
-
-    let mut roots = BTreeSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let entry = line.trim().trim_start_matches("./");
-        if entry.is_empty() {
-            continue;
+    match cpan_distribution_extractor::extract(tarball, dest) {
+        Ok(root) => Ok(root),
+        Err(cpan_distribution_extractor::Error::Layout { .. }) => {
+            Err(Error::TarballLayout(tarball.to_path_buf()))
         }
-        if let Some(root) = entry.split('/').next().filter(|s| !s.is_empty()) {
-            roots.insert(root.to_owned());
-        }
+        Err(e) => Err(Error::Extract(e)),
     }
-    let mut roots = roots.into_iter();
-    let (Some(root), None) = (roots.next(), roots.next()) else {
-        return Err(Error::TarballLayout(tarball.to_path_buf()));
-    };
-
-    let mut extract = Command::new(&tar);
-    if let Some(flag) = compression {
-        extract.arg(flag);
-    }
-    extract.arg("-xf").arg(tarball).arg("-C").arg(dest);
-    run(
-        &mut extract,
-        &format!(
-            "{} -xf {} -C {}",
-            tar.to_string_lossy(),
-            tarball.display(),
-            dest.display()
-        ),
-    )?;
-
-    Ok(dest.join(root))
 }
 
 // -- free helpers ---------------------------------------------------------
@@ -679,37 +639,6 @@ fn cctype_for_msc_ver(msc_ver: u32) -> Option<String> {
     Some(name.to_owned())
 }
 
-fn tar_program() -> OsString {
-    if let Some(tar) = std::env::var_os("PERL_BUILD_TAR") {
-        return tar;
-    }
-    if cfg!(any(target_os = "solaris", target_os = "illumos")) {
-        OsString::from("gtar")
-    } else {
-        OsString::from("tar")
-    }
-}
-
-fn compression_flag(tarball: &Path) -> Option<&'static str> {
-    let name = tarball
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        Some("-z")
-    } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz") || name.ends_with(".tbz2") {
-        Some("-j")
-    } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
-        Some("-J")
-    } else if name.ends_with(".tar") {
-        None
-    } else {
-        // Unknown: assume gzip, which is what the CPAN Perl archives use.
-        Some("-z")
-    }
-}
-
 /// `true` for Perl >= 5.8 (which has `make test_harness`), read from
 /// `patchlevel.h` in the source tree; defaults to `true` when it cannot be
 /// determined.
@@ -787,24 +716,6 @@ fn temp_dir(prefix: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compression_flags_from_extension() {
-        assert_eq!(
-            compression_flag(Path::new("perl-5.38.2.tar.gz")),
-            Some("-z")
-        );
-        assert_eq!(
-            compression_flag(Path::new("perl-5.8.9.tar.bz2")),
-            Some("-j")
-        );
-        assert_eq!(
-            compression_flag(Path::new("perl-5.40.0.tar.xz")),
-            Some("-J")
-        );
-        assert_eq!(compression_flag(Path::new("perl.tar")), None);
-        assert_eq!(compression_flag(Path::new("weird-name")), Some("-z"));
-    }
 
     #[test]
     fn resolved_options_add_prefix_and_scriptdir() {
