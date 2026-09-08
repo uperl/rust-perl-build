@@ -78,11 +78,25 @@ cmd.status()?;
 `Perl::Build` applies
 [`Devel::PatchPerl`](https://metacpan.org/pod/Devel::PatchPerl) source fix-ups
 before `Configure`; without them, older Perls frequently fail to build on a
-modern toolchain. There is no Rust reimplementation of that logic, so this crate
-shells out to the `patchperl` program. By default (`PatchPerl::Auto`) it is used
-when found on `PATH` and skipped with a warning otherwise. Install it with
-`cpanm App::patchperl`, or point at a specific one with `PerlBuild::patchperl`.
-`PERL5_PATCHPERL_PLUGIN` is inherited by the `patchperl` child process.
+modern toolchain. This crate can apply them two ways, chosen with
+`PerlBuild::patchperl` / the `PatchPerl` enum:
+
+* the **external `patchperl` program** (`cpanm App::patchperl`);
+  `PERL5_PATCHPERL_PLUGIN` is inherited by the child, so Perl-module patch
+  plugins work as they do for `Perl::Build`;
+* the **in-process
+  [`patch-perl`](https://github.com/uperl/patch-perl) crate**, a Rust port of
+  the `Devel::PatchPerl` library — no external program. `PERL5_PATCHPERL_PLUGIN`
+  is ignored on this path (the crate resolves it to a native shared library, not
+  a Perl module); use the external `patchperl` if you need patch plugins.
+
+| `PatchPerl` | behaviour |
+|---|---|
+| `Auto` (default) | external `patchperl` if on `PATH`, otherwise the in-process port — the fix-ups are always applied |
+| `External` | external `patchperl` only; warn and build without the fix-ups if it is missing |
+| `Command(path)` | a specific external program |
+| `Internal` | the in-process `patch-perl` crate |
+| `Disabled` | no fix-ups |
 
 ## Windows
 
@@ -109,7 +123,7 @@ Honoured for parity with `Perl::Build`:
 | --- | --- |
 | `PERL_BUILD_COMPILE_OPTIONS` | extra arguments appended to `make` (or `nmake`; a `CCTYPE=...` here disables auto-detection) |
 | `PERL_BUILD_INSTALL_OPTIONS` | extra arguments appended to `make install` |
-| `PERL5_PATCHPERL_PLUGIN` | read by `patchperl` (Devel::PatchPerl plugin) |
+| `PERL5_PATCHPERL_PLUGIN` | Devel::PatchPerl plugin — a Perl module for the external `patchperl`, a native shared library for the in-process port |
 | `PERL_BUILD_TAR` | `tar` program to use for unpacking (default `tar`, `gtar` on illumos/Solaris) |
 | `PERL_BUILD_NMAKE` | make program for the Windows / Visual C++ build (default `nmake`) |
 

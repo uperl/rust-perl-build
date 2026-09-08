@@ -69,14 +69,23 @@
 //!
 //! `Perl::Build` applies [`Devel::PatchPerl`](https://metacpan.org/pod/Devel::PatchPerl)
 //! fix-ups to the source tree before `Configure`; without them, older Perls
-//! frequently fail to build on a modern toolchain. There is no Rust
-//! reimplementation of that logic, so this crate shells out to the `patchperl`
-//! program instead. By default ([`PatchPerl::Auto`]) it is used when found on
-//! `PATH` and skipped with a warning otherwise. Install it from CPAN with
-//! `cpanm App::patchperl`, or point at a specific one with
-//! [`PerlBuild::patchperl`]. The `PERL5_PATCHPERL_PLUGIN` environment variable
-//! is inherited by the `patchperl` child process, so patch plugins work as they
-//! do for `Perl::Build`.
+//! frequently fail to build on a modern toolchain. This crate can apply them
+//! two ways, selected with [`PerlBuild::patchperl`] / [`PatchPerl`]:
+//!
+//! * the **external `patchperl` program** (from `App::patchperl` on CPAN); the
+//!   `PERL5_PATCHPERL_PLUGIN` environment variable is inherited by the child, so
+//!   Perl-module patch plugins work as they do for `Perl::Build`;
+//! * the **in-process [`patch-perl`](patch_perl) crate**, a Rust port of the
+//!   `Devel::PatchPerl` library — no external program, no `sh` / `patch`. The
+//!   `PERL5_PATCHPERL_PLUGIN` hook is not honoured on this path (the crate
+//!   resolves it to a native shared library, not a Perl module), so it applies
+//!   only the standard fix-ups.
+//!
+//! The default, [`PatchPerl::Auto`], uses the external program when it is on
+//! `PATH` and the in-process port otherwise, so the fix-ups are always applied.
+//! [`PatchPerl::External`] keeps the old behaviour (external only; warn and skip
+//! when missing), [`PatchPerl::Internal`] always uses the crate, and
+//! [`PatchPerl::Disabled`] applies nothing.
 //!
 //! # Windows and Visual C++
 //!

@@ -12,20 +12,29 @@ use crate::built::{Built, symlink_devel_executables};
 use crate::error::{Error, Result};
 use crate::releases::PerlReleases;
 
-/// How to run [`Devel::PatchPerl`](https://metacpan.org/pod/Devel::PatchPerl)
+/// How to apply [`Devel::PatchPerl`](https://metacpan.org/pod/Devel::PatchPerl)
 /// source fix-ups before `Configure`.
 ///
-/// There is no Rust port of `Devel::PatchPerl`, so this crate shells out to the
-/// `patchperl` program. See the [crate docs](crate#patchperl).
+/// The fix-ups can be applied by the external `patchperl` program (from
+/// `App::patchperl` on CPAN) or in-process by the [`patch-perl`](patch_perl)
+/// crate — a Rust port of the `Devel::PatchPerl` library. See the
+/// [crate docs](crate#patchperl).
 #[derive(Debug, Clone, Default)]
 pub enum PatchPerl {
-    /// Run `patchperl` from `PATH` if it is there; otherwise skip patching and
-    /// log a warning. This is the default.
+    /// Use the external `patchperl` when it is on `PATH`; otherwise fall back to
+    /// the in-process [`patch-perl`](patch_perl) port. This is the default, and
+    /// always applies the fix-ups one way or another.
     #[default]
     Auto,
-    /// Always run this specific program (a name resolved via `PATH`, or a full
-    /// path).
+    /// Always use the external `patchperl` on `PATH`. If it cannot be run, warn
+    /// and build without the fix-ups (older Perls may then fail to build).
+    External,
+    /// Always run this specific external program (a name resolved via `PATH`, or
+    /// a full path).
     Command(OsString),
+    /// Always apply the fix-ups in-process with the [`patch-perl`](patch_perl)
+    /// crate, with no external program.
+    Internal,
     /// Never patch the source tree.
     Disabled,
 }
@@ -157,7 +166,9 @@ impl PerlBuild {
         self
     }
 
-    /// How to apply `patchperl` fix-ups. Default: [`PatchPerl::Auto`].
+    /// How to apply the [`Devel::PatchPerl`](patch_perl) fix-ups — the external
+    /// `patchperl` program, the in-process [`patch-perl`](patch_perl) crate, or
+    /// not at all. Default: [`PatchPerl::Auto`].
     pub fn patchperl(mut self, patchperl: PatchPerl) -> Self {
         self.patchperl = patchperl;
         self
@@ -434,16 +445,28 @@ impl PerlBuild {
                 log::info!("patchperl: disabled");
                 return Ok(());
             }
+            PatchPerl::Internal => return run_patchperl_internal(src),
             PatchPerl::Command(program) => program.clone(),
-            PatchPerl::Auto => match which("patchperl") {
+            PatchPerl::External => match which("patchperl") {
                 Some(_) => OsString::from("patchperl"),
                 None => {
                     log::warn!(
                         "`patchperl` not found on PATH; building without Devel::PatchPerl \
                          fix-ups (older Perls may fail to build). Install it with \
-                         `cpanm App::patchperl`, or pass PatchPerl::Disabled to silence this."
+                         `cpanm App::patchperl`, use PatchPerl::Internal for the in-process \
+                         port, or pass PatchPerl::Disabled to silence this."
                     );
                     return Ok(());
+                }
+            },
+            PatchPerl::Auto => match which("patchperl") {
+                Some(_) => OsString::from("patchperl"),
+                None => {
+                    log::info!(
+                        "`patchperl` not found on PATH; applying Devel::PatchPerl fix-ups \
+                         in-process with the patch-perl crate"
+                    );
+                    return run_patchperl_internal(src);
                 }
             },
         };
@@ -454,6 +477,27 @@ impl PerlBuild {
             &format!("{} (patchperl)", program.to_string_lossy()),
         )
     }
+}
+
+/// Apply the standard Devel::PatchPerl fix-ups to `src` in-process with the
+/// [`patch-perl`](patch_perl) crate. The Perl version is read from the tree's
+/// `patchlevel.h`.
+///
+/// The `PERL5_PATCHPERL_PLUGIN` hook is **not** honoured here: `patch-perl`
+/// resolves it to a native shared library rather than the Perl module the
+/// external `patchperl` expects, so silently acting on it would break a build
+/// that has a Perl-module plugin configured. Use the external `patchperl`
+/// ([`PatchPerl::External`] / [`PatchPerl::Command`]) if you need plugins.
+fn run_patchperl_internal(src: &Path) -> Result<()> {
+    log::info!(
+        "applying Devel::PatchPerl fix-ups in-process (patch-perl crate) in {}",
+        src.display()
+    );
+    patch_perl::PatchPerl::new()
+        .source(src)
+        .run_plugins(false)
+        .run()?;
+    Ok(())
 }
 
 /// Unpack `tarball` into `dest`, returning the path of the single top-level
@@ -861,5 +905,61 @@ mod tests {
             url_filename("https://example.com/pub/perl/"),
             "perl-source.tar.gz"
         );
+    }
+
+    #[test]
+    fn patchperl_default_is_auto() {
+        assert!(matches!(PatchPerl::default(), PatchPerl::Auto));
+    }
+
+    /// A stand-in Perl source tree: just a `patchlevel.h` declaring `5.V.S`.
+    fn fake_source_tree(tag: &str, version: u32, subversion: u32) -> PathBuf {
+        let dir = temp_dir(&format!("perl-build-patchperl-{tag}")).unwrap();
+        std::fs::write(
+            dir.join("patchlevel.h"),
+            format!(
+                "#define PERL_REVISION 5\n#define PERL_VERSION {version}\n\
+                 #define PERL_SUBVERSION {subversion}\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn internal_patchperl_applies_cleanly_to_a_modern_tree() {
+        // 5.40 is past Devel::PatchPerl's CERTIFIED cutoff, so the in-process
+        // port has no fix-ups to apply and must still succeed.
+        let src = fake_source_tree("modern", 40, 0);
+        run_patchperl_internal(&src).expect("in-process patchperl on a modern tree");
+        assert!(src.join("patchlevel.h").is_file());
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn run_patchperl_routes_disabled_and_internal() {
+        // Disabled: a no-op, no source tree needed.
+        PerlBuild::new("/unused")
+            .patchperl(PatchPerl::Disabled)
+            .run_patchperl(Path::new("/definitely/not/a/tree"))
+            .expect("Disabled is a no-op");
+
+        // Internal: routes through the patch-perl crate.
+        let src = fake_source_tree("route", 40, 0);
+        PerlBuild::new("/unused")
+            .patchperl(PatchPerl::Internal)
+            .run_patchperl(&src)
+            .expect("Internal routes to the patch-perl crate");
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn internal_patchperl_reports_a_non_source_tree_as_patchperl_error() {
+        let dir = temp_dir("perl-build-patchperl-empty").unwrap();
+        match run_patchperl_internal(&dir) {
+            Err(Error::PatchPerl(_)) => {}
+            other => panic!("expected Error::PatchPerl, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
