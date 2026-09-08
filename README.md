@@ -124,7 +124,6 @@ Honoured for parity with `Perl::Build`:
 | `PERL_BUILD_COMPILE_OPTIONS` | extra arguments appended to `make` (or `nmake`; a `CCTYPE=...` here disables auto-detection) |
 | `PERL_BUILD_INSTALL_OPTIONS` | extra arguments appended to `make install` |
 | `PERL5_PATCHPERL_PLUGIN` | Devel::PatchPerl plugin — a Perl module for the external `patchperl`, a native shared library for the in-process port |
-| `PERL_BUILD_TAR` | `tar` program to use for unpacking (default `tar`, `gtar` on illumos/Solaris) |
 | `PERL_BUILD_NMAKE` | make program for the Windows / Visual C++ build (default `nmake`) |
 
 `PERL5LIB` and `PERL5OPT` are removed from the environment of every build

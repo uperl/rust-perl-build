@@ -31,7 +31,7 @@ pub enum Error {
         status: u16,
     },
 
-    /// An external program (`sh`, `make`, `tar`, `patchperl`, ...) could not be
+    /// An external program (`sh`, `make`, `patchperl`, ...) could not be
     /// started at all.
     #[error("could not spawn `{0}`: {1}")]
     Spawn(String, #[source] std::io::Error),
@@ -49,6 +49,11 @@ pub enum Error {
     /// source tree could not be located.
     #[error("tarball {0} does not unpack to exactly one top-level directory")]
     TarballLayout(PathBuf),
+
+    /// The source archive could not be unpacked (unrecognised or unsupported
+    /// format, an unsafe member path, a corrupt stream, ...).
+    #[error("could not unpack source archive: {0}")]
+    Extract(#[from] cpan_distribution_extractor::Error),
 
     /// The in-process [`patch-perl`](patch_perl) port failed to apply the
     /// Devel::PatchPerl fix-ups.
